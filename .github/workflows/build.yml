@@ -1,0 +1,295 @@
+name: Build BBD APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.6'
+          channel: 'stable'
+
+      - name: Create Flutter Project & Setup Files
+        run: |
+          # ফ্ল্যাটার প্রজেক্ট তৈরি
+          flutter create --org com.bbd.blood --project-name bbd_app app
+          cd app
+
+          # ডিপেন্ডেন্সি অ্যাড করা
+          flutter pub add url_launcher intl
+
+          # মেইন কোড বসানো (BBD App Code)
+          cat << 'EOF' > lib/main.dart
+          import 'package:flutter/material.dart';
+          import 'package:url_launcher/url_launcher.dart';
+
+          void main() {
+            runApp(const BBDApp());
+          }
+
+          class BBDApp extends StatelessWidget {
+            const BBDApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Bangladesh Blood Donor',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  scaffoldBackgroundColor: Colors.white,
+                  primaryColor: const Color(0xFFD32F2F),
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xFFD32F2F),
+                    primary: const Color(0xFFD32F2F),
+                  ),
+                  appBarTheme: const AppBarTheme(
+                    backgroundColor: Color(0xFFD32F2F),
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                  ),
+                ),
+                home: const HomeScreen(),
+              );
+            }
+          }
+
+          class HomeScreen extends StatelessWidget {
+            const HomeScreen({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Spacer(),
+                        const Text(
+                          'Bangladesh Blood Donor',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFD32F2F),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'BBD',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFD32F2F),
+                          ),
+                        ),
+                        const SizedBox(height: 50),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFD32F2F),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          icon: const Icon(Icons.search),
+                          label: const Text('রক্ত খুঁজুন', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          onPressed: () {
+                            Navigator.push(context, MaterialPageRoute(builder: (context) => const SearchScreen()));
+                          },
+                        ),
+                        const SizedBox(height: 16),
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFFD32F2F),
+                            side: const BorderSide(color: Color(0xFFD32F2F), width: 2),
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          icon: const Icon(Icons.person_add),
+                          label: const Text('রক্তদাতা হিসেবে নিবন্ধন', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          onPressed: () {
+                            Navigator.push(context, MaterialPageRoute(builder: (context) => const RegisterScreen()));
+                          },
+                        ),
+                        const Spacer(),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          class SearchScreen extends StatefulWidget {
+            const SearchScreen({super.key});
+            @override
+            State<SearchScreen> createState() => _SearchScreenState();
+          }
+
+          class _SearchScreenState extends State<SearchScreen> {
+            String selectedBlood = 'A+';
+            String selectedDist = 'Dhaka';
+
+            final List<Map<String, String>> sampleDonors = [
+              {'name': 'আরিফুল ইসলাম', 'blood': 'A+', 'dist': 'Dhaka', 'upz': 'Dhanmondi', 'age': '24', 'phone': '01700000001'},
+              {'name': 'তানভীর আহমেদ', 'blood': 'A+', 'dist': 'Dhaka', 'upz': 'Mirpur', 'age': '28', 'phone': '01700000002'},
+            ];
+
+            Future<void> _callPhone(String number) async {
+              final Uri uri = Uri(scheme: 'tel', path: number);
+              if (await canLaunchUrl(uri)) await launchUrl(uri);
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
+                      child: const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('রক্তগ্রহীতাদের জন্য জরুরি সতর্কতা:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                          SizedBox(height: 4),
+                          Text('• BBD-তে রক্তদানের বিনিময়ে টাকা নেওয়া সম্পূর্ণ নিষিদ্ধ।\n• রক্ত নেওয়ার পূর্বে হাসপাতালে রক্তের ক্রস-ম্যাচিং যাচাই করুন।'),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    DropdownButtonFormField<String>(
+                      value: selectedBlood,
+                      decoration: const InputDecoration(labelText: 'রক্তের গ্রুপ'),
+                      items: ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']
+                          .map((b) => DropdownMenuItem(value: b, child: Text(b)))
+                          .toList(),
+                      onChanged: (v) => setState(() => selectedBlood = v!),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text('উপলব্ধ রক্তদাতাদের তালিকা:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                    const SizedBox(height: 8),
+                    ...sampleDonors.map((d) => Card(
+                      child: ListTile(
+                        title: Text('${d['name']} (${d['blood']})'),
+                        subtitle: Text('ঠিকানা: ${d['upz']}, ${d['dist']}\nবয়স: ${d['age']} বছর'),
+                        trailing: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
+                          child: const Text('কল করুন'),
+                          onPressed: () => _callPhone(d['phone']!),
+                        ),
+                      ),
+                    )),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class RegisterScreen extends StatefulWidget {
+            const RegisterScreen({super.key});
+            @override
+            State<RegisterScreen> createState() => _RegisterScreenState();
+          }
+
+          class _RegisterScreenState extends State<RegisterScreen> {
+            final _name = TextEditingController();
+            final _phone = TextEditingController();
+            DateTime? _dob;
+            String _bg = 'A+';
+
+            void _register() {
+              if (_name.text.isEmpty || _phone.text.isEmpty || _dob == null) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('সবগুলো ঘর পূরণ করুন')));
+                return;
+              }
+              final age = DateTime.now().year - _dob!.year;
+              if (age < 18) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('রক্তদাতা হতে বয়স ন্যূনতম ১৮ বছর হতে হবে!')));
+                return;
+              }
+              showDialog(
+                context: context,
+                builder: (c) => AlertDialog(
+                  title: const Text('নিবন্ধন সফল!'),
+                  content: Text('আপনার রিকভারি কোড: BBD-${DateTime.now().millisecondsSinceEpoch.toString().substring(5)}\n\nকোডটি সংরক্ষণ করুন।'),
+                  actions: [TextButton(onPressed: () { Navigator.pop(c); Navigator.pop(context); }, child: const Text('ঠিক আছে'))],
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('রক্তদাতা নিবন্ধন')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    TextField(controller: _name, decoration: const InputDecoration(labelText: 'পূর্ণ নাম')),
+                    const SizedBox(height: 8),
+                    TextField(controller: _phone, decoration: const InputDecoration(labelText: 'ফোন নম্বর'), keyboardType: TextInputType.phone),
+                    const SizedBox(height: 8),
+                    ListTile(
+                      title: Text(_dob == null ? 'জন্মতারিখ নির্বাচন করুন' : 'জন্মতারিখ: ${_dob!.day}/${_dob!.month}/${_dob!.year}'),
+                      trailing: const Icon(Icons.calendar_today),
+                      onTap: () async {
+                        final d = await showDatePicker(context: context, initialDate: DateTime(2000), firstDate: DateTime(1950), lastDate: DateTime.now());
+                        if (d != null) setState(() => _dob = d);
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: _bg,
+                      decoration: const InputDecoration(labelText: 'রক্তের গ্রুপ'),
+                      items: ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']
+                          .map((b) => DropdownMenuItem(value: b, child: Text(b)))
+                          .toList(),
+                      onChanged: (v) => setState(() => _bg = v!),
+                    ),
+                    const SizedBox(height: 24),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFD32F2F),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.all(14),
+                      ),
+                      onPressed: _register,
+                      child: const Text('নিবন্ধন সম্পন্ন করুন', style: TextStyle(fontSize: 16)),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build Android APK
+        run: |
+          cd app
+          flutter build apk --debug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BBD-Blood-Donor-App
+          path: app/build/app/outputs/flutter-apk/app-debug.apk
