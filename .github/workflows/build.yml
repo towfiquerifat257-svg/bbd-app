@@ -1,45 +1,156 @@
+
 name: Build BBD APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          distribution: zulu
+          java-version: "17"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.19.6'
-          channel: 'stable'
+          flutter-version: "3.19.6"
+          channel: stable
 
-      - name: Create Flutter Project & Setup Files
+      - name: Find Firebase Configuration
+        shell: bash
         run: |
-          # ফ্ল্যাটার প্রজেক্ট তৈরি
-          flutter create --org com.bbd.blood --project-name bbd_app app
+          FILE=$(find . -type f \
+            -name 'google-services.json' \
+            -not -path './.git/*' \
+            -print -quit)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: google-services.json not found."
+            echo "Upload it to the repository before building."
+            exit 1
+          fi
+
+          cp "$FILE" "$RUNNER_TEMP/google-services.json"
+
+      - name: Download Bangladesh Locations
+        shell: bash
+        run: |
+          mkdir -p app/assets
+
+          curl -fL --retry 3 \
+            "https://iqbalhasandev.github.io/bangladesh-geo-json/bangladesh-geo.json" \
+            -o app/assets/bangladesh-geo.json
+
+          python3 - <<'PY'
+          import json
+          with open("app/assets/bangladesh-geo.json", encoding="utf-8") as f:
+              data = json.load(f)
+          assert isinstance(data, list) and len(data) > 0
+          assert all("districts" in d for d in data)
+          print("Bangladesh location data downloaded successfully.")
+          PY
+
+      - name: Create Flutter Project
+        shell: bash
+        run: |
+          flutter create \
+            --org com.bbd.blood \
+            --project-name bbd_app app
+
+          cp "$RUNNER_TEMP/google-services.json" \
+            app/android/app/google-services.json
+
           cd app
 
-          # ডিপেন্ডেন্সি অ্যাড করা
-          flutter pub add url_launcher intl
+          flutter pub add firebase_core cloud_firestore url_launcher
 
-          # মেইন কোড বসানো (BBD App Code)
-          cat << 'EOF' > lib/main.dart
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("pubspec.yaml")
+          s = p.read_text()
+
+          asset_line = "    - assets/bangladesh-geo.json\n"
+
+          if "flutter:\n" not in s:
+              raise SystemExit("ERROR: flutter section missing in pubspec.yaml")
+
+          if "assets/bangladesh-geo.json" not in s:
+              s = s.replace(
+                  "flutter:\n",
+                  "flutter:\n  assets:\n" + asset_line,
+                  1
+              )
+
+          p.write_text(s)
+          PY
+
+      - name: Configure Google Services
+        shell: bash
+        run: |
+          grep -q "com.google.gms:google-services" app/android/build.gradle || \
+            sed -i "/dependencies {/a\\        classpath 'com.google.gms:google-services:4.4.1'" \
+              app/android/build.gradle
+
+          grep -q "com.google.gms.google-services" \
+            app/android/app/build.gradle || \
+            echo "apply plugin: 'com.google.gms.google-services'" \
+              >> app/android/app/build.gradle
+
+      - name: Create BBD Application
+        shell: bash
+        run: |
+          cat > app/lib/main.dart <<'DART'
+          import 'dart:convert';
           import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:firebase_core/firebase_core.dart';
+          import 'package:cloud_firestore/cloud_firestore.dart';
           import 'package:url_launcher/url_launcher.dart';
 
-          void main() {
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await Firebase.initializeApp();
             runApp(const BBDApp());
+          }
+
+          const red = Color(0xFFD32F2F);
+          const bloodGroups = [
+            'A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-'
+          ];
+
+          class LocationData {
+            final List<Map<String, dynamic>> divisions;
+
+            LocationData(this.divisions);
+
+            static Future<LocationData> load() async {
+              final raw = await rootBundle.loadString(
+                'assets/bangladesh-geo.json',
+              );
+              final list = jsonDecode(raw) as List;
+              return LocationData(
+                list.map((e) => Map<String, dynamic>.from(e)).toList(),
+              );
+            }
+
+            String label(Map<String, dynamic> item) {
+              final bn = item['bn_name']?.toString() ?? '';
+              final en = item['name']?.toString() ?? '';
+              if (bn.isEmpty) return en;
+              if (en.isEmpty || en == bn) return bn;
+              return '$bn ($en)';
+            }
           }
 
           class BBDApp extends StatelessWidget {
@@ -48,19 +159,16 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'Bangladesh Blood Donor',
+                title: 'BBD - Blood Donor',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData(
-                  scaffoldBackgroundColor: Colors.white,
-                  primaryColor: const Color(0xFFD32F2F),
                   colorScheme: ColorScheme.fromSeed(
-                    seedColor: const Color(0xFFD32F2F),
-                    primary: const Color(0xFFD32F2F),
+                    seedColor: red,
+                    primary: red,
                   ),
                   appBarTheme: const AppBarTheme(
-                    backgroundColor: Color(0xFFD32F2F),
+                    backgroundColor: red,
                     foregroundColor: Colors.white,
-                    elevation: 0,
                   ),
                 ),
                 home: const HomeScreen(),
@@ -74,62 +182,47 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return Scaffold(
-                body: SafeArea(
+                appBar: AppBar(title: const Text('BBD - Blood Donor')),
+                body: Center(
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    padding: const EdgeInsets.all(24),
                     child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Spacer(),
+                        const Icon(Icons.bloodtype, size: 80, color: red),
                         const Text(
                           'Bangladesh Blood Donor',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             fontSize: 22,
                             fontWeight: FontWeight.bold,
-                            color: Color(0xFFD32F2F),
                           ),
                         ),
-                        const SizedBox(height: 6),
-                        const Text(
-                          'BBD',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFFD32F2F),
+                        const SizedBox(height: 24),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const SearchScreen(),
+                              ),
+                            ),
+                            child: const Text('রক্ত খুঁজুন'),
                           ),
                         ),
-                        const SizedBox(height: 50),
-                        ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFD32F2F),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton(
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const RegisterScreen(),
+                              ),
+                            ),
+                            child: const Text('রক্তদাতা হিসেবে নিবন্ধন'),
                           ),
-                          icon: const Icon(Icons.search),
-                          label: const Text('রক্ত খুঁজুন', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                          onPressed: () {
-                            Navigator.push(context, MaterialPageRoute(builder: (context) => const SearchScreen()));
-                          },
                         ),
-                        const SizedBox(height: 16),
-                        OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFFD32F2F),
-                            side: const BorderSide(color: Color(0xFFD32F2F), width: 2),
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                          icon: const Icon(Icons.person_add),
-                          label: const Text('রক্তদাতা হিসেবে নিবন্ধন', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                          onPressed: () {
-                            Navigator.push(context, MaterialPageRoute(builder: (context) => const RegisterScreen()));
-                          },
-                        ),
-                        const Spacer(),
                       ],
                     ),
                   ),
@@ -138,103 +231,179 @@ jobs:
             }
           }
 
-          class SearchScreen extends StatefulWidget {
-            const SearchScreen({super.key});
-            @override
-            State<SearchScreen> createState() => _SearchScreenState();
-          }
-
-          class _SearchScreenState extends State<SearchScreen> {
-            String selectedBlood = 'A+';
-            String selectedDist = 'Dhaka';
-
-            final List<Map<String, String>> sampleDonors = [
-              {'name': 'আরিফুল ইসলাম', 'blood': 'A+', 'dist': 'Dhaka', 'upz': 'Dhanmondi', 'age': '24', 'phone': '01700000001'},
-              {'name': 'তানভীর আহমেদ', 'blood': 'A+', 'dist': 'Dhaka', 'upz': 'Mirpur', 'age': '28', 'phone': '01700000002'},
-            ];
-
-            Future<void> _callPhone(String number) async {
-              final Uri uri = Uri(scheme: 'tel', path: number);
-              if (await canLaunchUrl(uri)) await launchUrl(uri);
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              return Scaffold(
-                appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
-                body: ListView(
-                  padding: const EdgeInsets.all(16),
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
-                      child: const Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('রক্তগ্রহীতাদের জন্য জরুরি সতর্কতা:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                          SizedBox(height: 4),
-                          Text('• BBD-তে রক্তদানের বিনিময়ে টাকা নেওয়া সম্পূর্ণ নিষিদ্ধ।\n• রক্ত নেওয়ার পূর্বে হাসপাতালে রক্তের ক্রস-ম্যাচিং যাচাই করুন।'),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    DropdownButtonFormField<String>(
-                      value: selectedBlood,
-                      decoration: const InputDecoration(labelText: 'রক্তের গ্রুপ'),
-                      items: ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']
-                          .map((b) => DropdownMenuItem(value: b, child: Text(b)))
-                          .toList(),
-                      onChanged: (v) => setState(() => selectedBlood = v!),
-                    ),
-                    const SizedBox(height: 20),
-                    const Text('উপলব্ধ রক্তদাতাদের তালিকা:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                    const SizedBox(height: 8),
-                    ...sampleDonors.map((d) => Card(
-                      child: ListTile(
-                        title: Text('${d['name']} (${d['blood']})'),
-                        subtitle: Text('ঠিকানা: ${d['upz']}, ${d['dist']}\nবয়স: ${d['age']} বছর'),
-                        trailing: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
-                          child: const Text('কল করুন'),
-                          onPressed: () => _callPhone(d['phone']!),
-                        ),
-                      ),
-                    )),
-                  ],
-                ),
-              );
-            }
-          }
-
           class RegisterScreen extends StatefulWidget {
             const RegisterScreen({super.key});
+
             @override
             State<RegisterScreen> createState() => _RegisterScreenState();
           }
 
           class _RegisterScreenState extends State<RegisterScreen> {
-            final _name = TextEditingController();
-            final _phone = TextEditingController();
-            DateTime? _dob;
-            String _bg = 'A+';
+            final name = TextEditingController();
+            final phone = TextEditingController();
 
-            void _register() {
-              if (_name.text.isEmpty || _phone.text.isEmpty || _dob == null) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('সবগুলো ঘর পূরণ করুন')));
+            LocationData? locations;
+            Map<String, dynamic>? division;
+            Map<String, dynamic>? district;
+            Map<String, dynamic>? upazila;
+
+            DateTime? dob;
+            String blood = 'A+';
+            bool saving = false;
+            String? locationError;
+
+            @override
+            void initState() {
+              super.initState();
+              loadLocations();
+            }
+
+            Future<void> loadLocations() async {
+              try {
+                final data = await LocationData.load();
+                if (!mounted) return;
+                setState(() {
+                  locations = data;
+                  division = data.divisions.first;
+                  final ds = districtList;
+                  if (ds.isNotEmpty) district = ds.first;
+                  final us = upazilaList;
+                  if (us.isNotEmpty) upazila = us.first;
+                });
+              } catch (e) {
+                if (!mounted) return;
+                setState(() => locationError = 'লোকেশন লোড হয়নি: $e');
+              }
+            }
+
+            List<Map<String, dynamic>> get divisionList =>
+                locations?.divisions ?? [];
+
+            List<Map<String, dynamic>> get districtList {
+              final list = division?['districts'] as List? ?? [];
+              return list.map((e) => Map<String, dynamic>.from(e)).toList();
+            }
+
+            List<Map<String, dynamic>> get upazilaList {
+              final list = district?['upazilas'] as List? ?? [];
+              return list.map((e) => Map<String, dynamic>.from(e)).toList();
+            }
+
+            @override
+            void dispose() {
+              name.dispose();
+              phone.dispose();
+              super.dispose();
+            }
+
+            Future<void> register() async {
+              if (name.text.trim().isEmpty ||
+                  phone.text.trim().isEmpty ||
+                  dob == null ||
+                  division == null ||
+                  district == null ||
+                  upazila == null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('সব তথ্য পূরণ ও লোকেশন নির্বাচন করো'),
+                  ),
+                );
                 return;
               }
-              final age = DateTime.now().year - _dob!.year;
+
+              final now = DateTime.now();
+              final birth = dob!;
+              int age = now.year - birth.year;
+              if (now.month < birth.month ||
+                  (now.month == birth.month && now.day < birth.day)) {
+                age--;
+              }
+
               if (age < 18) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('রক্তদাতা হতে বয়স ন্যূনতম ১৮ বছর হতে হবে!')));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('রক্তদাতা হতে ন্যূনতম ১৮ বছর হতে হবে'),
+                  ),
+                );
                 return;
               }
-              showDialog(
-                context: context,
-                builder: (c) => AlertDialog(
-                  title: const Text('নিবন্ধন সফল!'),
-                  content: Text('আপনার রিকভারি কোড: BBD-${DateTime.now().millisecondsSinceEpoch.toString().substring(5)}\n\nকোডটি সংরক্ষণ করুন।'),
-                  actions: [TextButton(onPressed: () { Navigator.pop(c); Navigator.pop(context); }, child: const Text('ঠিক আছে'))],
-                ),
+
+              setState(() => saving = true);
+
+              try {
+                await FirebaseFirestore.instance.collection('donors').add({
+                  'name': name.text.trim(),
+                  'phone': phone.text.trim(),
+                  'blood': blood,
+                  'division': division!['name'].toString(),
+                  'divisionBn': division!['bn_name']?.toString() ?? '',
+                  'district': district!['name'].toString(),
+                  'districtBn': district!['bn_name']?.toString() ?? '',
+                  'upazila': upazila!['name'].toString(),
+                  'upazilaBn': upazila!['bn_name']?.toString() ?? '',
+                  'dob': Timestamp.fromDate(birth),
+                  'createdAt': FieldValue.serverTimestamp(),
+                  'available': true,
+                });
+
+                if (!mounted) return;
+                await showDialog<void>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: const Text('নিবন্ধন সফল'),
+                    content: const Text(
+                      'তোমার তথ্য ডেটাবেজে সংরক্ষিত হয়েছে।',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(dialogContext),
+                        child: const Text('ঠিক আছে'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (mounted) Navigator.pop(context);
+              } catch (e) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('তথ্য সংরক্ষণ হয়নি: $e')),
+                );
+              } finally {
+                if (mounted) setState(() => saving = false);
+              }
+            }
+
+            Widget locationDropdown({
+              required String label,
+              required List<Map<String, dynamic>> items,
+              required Map<String, dynamic>? value,
+              required ValueChanged<Map<String, dynamic>?> onChanged,
+            }) {
+              return DropdownButtonFormField<String>(
+                value: items.any((e) => e['name'] == value?['name'])
+                    ? value!['name'].toString()
+                    : null,
+                isExpanded: true,
+                decoration: InputDecoration(labelText: label),
+                items: items.map((item) {
+                  return DropdownMenuItem<String>(
+                    value: item['name'].toString(),
+                    child: Text(
+                      locations!.label(item),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  );
+                }).toList(),
+                onChanged: (v) {
+                  if (v == null) return;
+                  for (final item in items) {
+                    if (item['name'].toString() == v) {
+                      onChanged(item);
+                      break;
+                    }
+                  }
+                },
               );
             }
 
@@ -242,50 +411,356 @@ jobs:
             Widget build(BuildContext context) {
               return Scaffold(
                 appBar: AppBar(title: const Text('রক্তদাতা নিবন্ধন')),
+                body: locations == null
+                    ? Center(
+                        child: locationError == null
+                            ? const CircularProgressIndicator()
+                            : Text(locationError!),
+                      )
+                    : ListView(
+                        padding: const EdgeInsets.all(16),
+                        children: [
+                          TextField(
+                            controller: name,
+                            decoration: const InputDecoration(
+                              labelText: 'পূর্ণ নাম',
+                            ),
+                          ),
+                          TextField(
+                            controller: phone,
+                            keyboardType: TextInputType.phone,
+                            decoration: const InputDecoration(
+                              labelText: 'ফোন নম্বর',
+                            ),
+                          ),
+                          ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(dob == null
+                                ? 'জন্মতারিখ নির্বাচন করো'
+                                : '${dob!.day}/${dob!.month}/${dob!.year}'),
+                            onTap: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: DateTime(2000),
+                                firstDate: DateTime(1900),
+                                lastDate: DateTime.now(),
+                              );
+                              if (picked != null) {
+                                setState(() => dob = picked);
+                              }
+                            },
+                          ),
+                          DropdownButtonFormField<String>(
+                            value: blood,
+                            decoration: const InputDecoration(
+                              labelText: 'রক্তের গ্রুপ',
+                            ),
+                            items: bloodGroups.map((b) =>
+                              DropdownMenuItem(value: b, child: Text(b))
+                            ).toList(),
+                            onChanged: (v) {
+                              if (v != null) setState(() => blood = v);
+                            },
+                          ),
+                          const SizedBox(height: 12),
+                          locationDropdown(
+                            label: 'বিভাগ',
+                            items: divisionList,
+                            value: division,
+                            onChanged: (v) => setState(() {
+                              division = v;
+                              district = districtList.isEmpty
+                                  ? null : districtList.first;
+                              upazila = upazilaList.isEmpty
+                                  ? null : upazilaList.first;
+                            }),
+                          ),
+                          const SizedBox(height: 12),
+                          locationDropdown(
+                            label: 'জেলা',
+                            items: districtList,
+                            value: district,
+                            onChanged: (v) => setState(() {
+                              district = v;
+                              upazila = upazilaList.isEmpty
+                                  ? null : upazilaList.first;
+                            }),
+                          ),
+                          const SizedBox(height: 12),
+                          locationDropdown(
+                            label: 'উপজেলা',
+                            items: upazilaList,
+                            value: upazila,
+                            onChanged: (v) => setState(() => upazila = v),
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton(
+                            onPressed: saving ? null : register,
+                            child: Text(
+                              saving ? 'সংরক্ষণ হচ্ছে...' : 'নিবন্ধন করুন',
+                            ),
+                          ),
+                        ],
+                      ),
+              );
+            }
+          }
+
+          class SearchScreen extends StatefulWidget {
+            const SearchScreen({super.key});
+
+            @override
+            State<SearchScreen> createState() => _SearchScreenState();
+          }
+
+          class _SearchScreenState extends State<SearchScreen> {
+            LocationData? locations;
+            Map<String, dynamic>? division;
+            Map<String, dynamic>? district;
+            Map<String, dynamic>? upazila;
+            String blood = 'A+';
+            bool searched = false;
+            String? locationError;
+
+            @override
+            void initState() {
+              super.initState();
+              loadLocations();
+            }
+
+            Future<void> loadLocations() async {
+              try {
+                final data = await LocationData.load();
+                if (!mounted) return;
+                setState(() {
+                  locations = data;
+                  division = data.divisions.first;
+                  district = districtList.first;
+                  upazila = upazilaList.first;
+                });
+              } catch (e) {
+                if (!mounted) return;
+                setState(() => locationError = 'লোকেশন লোড হয়নি: $e');
+              }
+            }
+
+            List<Map<String, dynamic>> get divisionList =>
+                locations?.divisions ?? [];
+
+            List<Map<String, dynamic>> get districtList {
+              final list = division?['districts'] as List? ?? [];
+              return list.map((e) => Map<String, dynamic>.from(e)).toList();
+            }
+
+            List<Map<String, dynamic>> get upazilaList {
+              final list = district?['upazilas'] as List? ?? [];
+              return list.map((e) => Map<String, dynamic>.from(e)).toList();
+            }
+
+            Widget locationDropdown({
+              required String label,
+              required List<Map<String, dynamic>> items,
+              required Map<String, dynamic>? value,
+              required ValueChanged<Map<String, dynamic>?> onChanged,
+            }) {
+              return DropdownButtonFormField<String>(
+                value: items.any((e) => e['name'] == value?['name'])
+                    ? value!['name'].toString()
+                    : null,
+                isExpanded: true,
+                decoration: InputDecoration(labelText: label),
+                items: items.map((item) => DropdownMenuItem<String>(
+                  value: item['name'].toString(),
+                  child: Text(
+                    locations!.label(item),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )).toList(),
+                onChanged: (v) {
+                  if (v == null) return;
+                  for (final item in items) {
+                    if (item['name'].toString() == v) {
+                      onChanged(item);
+                      break;
+                    }
+                  }
+                },
+              );
+            }
+
+            Future<void> callDonor(String phone) async {
+              final uri = Uri(scheme: 'tel', path: phone);
+              if (await canLaunchUrl(uri)) {
+                await launchUrl(uri);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              if (locations == null) {
+                return Scaffold(
+                  appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
+                  body: Center(
+                    child: locationError == null
+                        ? const CircularProgressIndicator()
+                        : Text(locationError!),
+                  ),
+                );
+              }
+
+              return Scaffold(
+                appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
                 body: ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
-                    TextField(controller: _name, decoration: const InputDecoration(labelText: 'পূর্ণ নাম')),
-                    const SizedBox(height: 8),
-                    TextField(controller: _phone, decoration: const InputDecoration(labelText: 'ফোন নম্বর'), keyboardType: TextInputType.phone),
-                    const SizedBox(height: 8),
-                    ListTile(
-                      title: Text(_dob == null ? 'জন্মতারিখ নির্বাচন করুন' : 'জন্মতারিখ: ${_dob!.day}/${_dob!.month}/${_dob!.year}'),
-                      trailing: const Icon(Icons.calendar_today),
-                      onTap: () async {
-                        final d = await showDatePicker(context: context, initialDate: DateTime(2000), firstDate: DateTime(1950), lastDate: DateTime.now());
-                        if (d != null) setState(() => _dob = d);
+                    DropdownButtonFormField<String>(
+                      value: blood,
+                      decoration: const InputDecoration(
+                        labelText: 'রক্তের গ্রুপ',
+                      ),
+                      items: bloodGroups.map((b) =>
+                        DropdownMenuItem(value: b, child: Text(b))
+                      ).toList(),
+                      onChanged: (v) {
+                        if (v != null) setState(() => blood = v);
                       },
                     ),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      value: _bg,
-                      decoration: const InputDecoration(labelText: 'রক্তের গ্রুপ'),
-                      items: ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']
-                          .map((b) => DropdownMenuItem(value: b, child: Text(b)))
-                          .toList(),
-                      onChanged: (v) => setState(() => _bg = v!),
+                    const SizedBox(height: 12),
+                    locationDropdown(
+                      label: 'বিভাগ',
+                      items: divisionList,
+                      value: division,
+                      onChanged: (v) => setState(() {
+                        division = v;
+                        district = districtList.first;
+                        upazila = upazilaList.first;
+                        searched = false;
+                      }),
                     ),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: 12),
+                    locationDropdown(
+                      label: 'জেলা',
+                      items: districtList,
+                      value: district,
+                      onChanged: (v) => setState(() {
+                        district = v;
+                        upazila = upazilaList.first;
+                        searched = false;
+                      }),
+                    ),
+                    const SizedBox(height: 12),
+                    locationDropdown(
+                      label: 'উপজেলা',
+                      items: upazilaList,
+                      value: upazila,
+                      onChanged: (v) => setState(() {
+                        upazila = v;
+                        searched = false;
+                      }),
+                    ),
+                    const SizedBox(height: 16),
                     ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFD32F2F),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.all(14),
-                      ),
-                      onPressed: _register,
-                      child: const Text('নিবন্ধন সম্পন্ন করুন', style: TextStyle(fontSize: 16)),
+                      onPressed: () => setState(() => searched = true),
+                      child: const Text('রক্তদাতা খুঁজুন'),
                     ),
+                    if (searched)
+                      StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        stream: FirebaseFirestore.instance
+                            .collection('donors')
+                            .where(
+                              'blood',
+                              isEqualTo: blood,
+                            )
+                            .where(
+                              'division',
+                              isEqualTo: division!['name'],
+                            )
+                            .where(
+                              'district',
+                              isEqualTo: district!['name'],
+                            )
+                            .where(
+                              'upazila',
+                              isEqualTo: upazila!['name'],
+                            )
+                            .where(
+                              'available',
+                              isEqualTo: true,
+                            )
+                            .snapshots(),
+                        builder: (context, snapshot) {
+                          if (snapshot.hasError) {
+                            return const Padding(
+                              padding: EdgeInsets.all(12),
+                              child: Text(
+                                'সার্চে সমস্যা হয়েছে। Firebase Rules বা '
+                                'ইন্টারনেট সংযোগ পরীক্ষা করো।',
+                              ),
+                            );
+                          }
+
+                          if (snapshot.connectionState ==
+                              ConnectionState.waiting) {
+                            return const Padding(
+                              padding: EdgeInsets.all(24),
+                              child: Center(
+                                child: CircularProgressIndicator(),
+                              ),
+                            );
+                          }
+
+                          final docs = snapshot.data?.docs ?? [];
+                          if (docs.isEmpty) {
+                            return const Padding(
+                              padding: EdgeInsets.all(16),
+                              child: Text(
+                                'এই উপজেলায় এই রক্তের গ্রুপের '
+                                'কোনো উপলভ্য রক্তদাতা পাওয়া যায়নি।',
+                              ),
+                            );
+                          }
+
+                          return Column(
+                            children: docs.map((doc) {
+                              final d = doc.data();
+                              return Card(
+                                child: ListTile(
+                                  title: Text(
+                                    '${d['name']} (${d['blood']})',
+                                  ),
+                                  subtitle: Text(
+                                    '${d['divisionBn']} বিভাগ, '
+                                    '${d['districtBn']} জেলা, '
+                                    '${d['upazilaBn']} উপজেলা\n'
+                                    '${d['phone']}',
+                                  ),
+                                  trailing: IconButton(
+                                    icon: const Icon(
+                                      Icons.call,
+                                      color: Colors.green,
+                                    ),
+                                    onPressed: () => callDonor(
+                                      d['phone'].toString(),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }).toList(),
+                          );
+                        },
+                      ),
                   ],
                 ),
               );
             }
           }
-          EOF
+          DART
 
       - name: Build Android APK
         run: |
           cd app
+          flutter pub get
+          flutter analyze
           flutter build apk --debug
 
       - name: Upload APK Artifact
