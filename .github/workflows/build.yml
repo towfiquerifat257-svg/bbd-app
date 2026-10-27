@@ -154,6 +154,116 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
+
+          root = Path("app/android")
+          settings = root / "settings.gradle"
+          app_gradle = root / "app/build.gradle"
+
+          for path in (settings, app_gradle):
+              if not path.is_file():
+                  raise SystemExit(f"Missing Gradle file: {path}")
+
+          # Register Google Services plugin.
+          s = settings.read_text(encoding="utf-8")
+
+          if "com.google.gms.google-services" not in s:
+              match = re.search(r"(?m)^plugins\s*\{", s)
+              if not match:
+                  raise SystemExit(
+                      "No plugins block found in settings.gradle"
+                  )
+
+              s = (
+                  s[:match.end()]
+                  + '\n    id "com.google.gms.google-services" '
+                    'version "4.4.1" apply false'
+                  + s[match.end():]
+              )
+
+          settings.write_text(s, encoding="utf-8")
+
+          # Apply plugin to the Android app module.
+          s = app_gradle.read_text(encoding="utf-8")
+
+          if "com.google.gms.google-services" not in s:
+              match = re.search(r"(?m)^plugins\s*\{", s)
+              if not match:
+                  raise SystemExit(
+                      "No plugins block found in app/build.gradle"
+                  )
+
+              close = s.find("}", match.end())
+              if close == -1:
+                  raise SystemExit(
+                      "Could not find end of app plugins block"
+                  )
+
+              s = (
+                  s[:close]
+                  + '\n    id "com.google.gms.google-services"\n'
+                  + s[close:]
+              )
+
+          app_gradle.write_text(s, encoding="utf-8")
+          print("Google Services plugin configured.")
+          PY
+          from pathlib import Path
+          import re
+
+          root = Path("app/android")
+          settings = root / "settings.gradle"
+          app_gradle = root / "app/build.gradle"
+
+          for path in (settings, app_gradle):
+              if not path.is_file():
+                  raise SystemExit(f"Missing Gradle file: {path}")
+
+          # Register Google Services plugin.
+          s = settings.read_text(encoding="utf-8")
+
+          if "com.google.gms.google-services" not in s:
+              match = re.search(r"(?m)^plugins\s*\{", s)
+              if not match:
+                  raise SystemExit(
+                      "No plugins block found in settings.gradle"
+                  )
+
+              s = (
+                  s[:match.end()]
+                  + '\n    id "com.google.gms.google-services" '
+                    'version "4.4.1" apply false'
+                  + s[match.end():]
+              )
+
+          settings.write_text(s, encoding="utf-8")
+
+          # Apply plugin to the Android app module.
+          s = app_gradle.read_text(encoding="utf-8")
+
+          if "com.google.gms.google-services" not in s:
+              match = re.search(r"(?m)^plugins\s*\{", s)
+              if not match:
+                  raise SystemExit(
+                      "No plugins block found in app/build.gradle"
+                  )
+
+              close = s.find("}", match.end())
+              if close == -1:
+                  raise SystemExit(
+                      "Could not find end of app plugins block"
+                  )
+
+              s = (
+                  s[:close]
+                  + '\n    id "com.google.gms.google-services"\n'
+                  + s[close:]
+              )
+
+          app_gradle.write_text(s, encoding="utf-8")
+          print("Google Services plugin configured.")
+          PY
+          from pathlib import Path
 
           root = Path("app/android")
           project = root / "build.gradle"
