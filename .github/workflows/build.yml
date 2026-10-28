@@ -2,15 +2,30 @@ name: Build BBD APK
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+    paths:
+      - "app/**"
+      - ".github/workflows/build-apk.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: bbd-apk-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout Repository
@@ -19,975 +34,115 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          distribution: zulu
+          distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.19.6"
           channel: stable
           cache: true
 
-      - name: Find Firebase Configuration
-        shell: bash
+      - name: Check Flutter Installation
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          java -version
+
+      - name: Check BBD Flutter Project
         run: |
           set -euo pipefail
 
-          FILE="$(find . -type f \
-            -name 'google-services.json' \
-            -not -path './.git/*' \
-            -not -path './app/build/*' \
-            -print -quit)"
-
-          if [ -z "$FILE" ]; then
-            echo "::error::google-services.json was not found."
+          if [[ ! -f app/pubspec.yaml ]]; then
+            echo "::error::app/pubspec.yaml not found."
+            echo "The Flutter application source must exist inside app/."
             exit 1
           fi
 
-          mkdir -p "$RUNNER_TEMP/bbd"
-          cp "$FILE" "$RUNNER_TEMP/bbd/google-services.json"
+          if [[ ! -d app/android ]]; then
+            echo "::error::app/android folder not found."
+            exit 1
+          fi
 
-      - name: Download Bangladesh Locations
-        shell: bash
+          echo "BBD Flutter project found."
+
+      - name: Configure Firebase Android File
+        env:
+          FIREBASE_CONFIG_JSON: ${{ secrets.FIREBASE_CONFIG_JSON }}
         run: |
           set -euo pipefail
 
-          curl -fLsS --retry 3 \
-            "https://iqbalhasandev.github.io/bangladesh-geo-json/bangladesh-geo.json" \
-            -o "$RUNNER_TEMP/bbd/bangladesh-geo.json"
-
-          python3 - <<'PY'
+          if [[ -n "${FIREBASE_CONFIG_JSON:-}" ]]; then
+            python3 - <<'PY'
           import json
           import os
+          from pathlib import Path
 
-          path = os.path.join(
-              os.environ["RUNNER_TEMP"],
-              "bbd",
-              "bangladesh-geo.json"
+          raw = os.environ["FIREBASE_CONFIG_JSON"]
+          data = json.loads(raw)
+
+          if not isinstance(data, dict):
+              raise SystemExit("Firebase configuration must be a JSON object.")
+
+          if not data.get("project_info", {}).get("project_id"):
+              raise SystemExit("Firebase project_id is missing.")
+
+          if not data.get("client"):
+              raise SystemExit("Firebase client configuration is missing.")
+
+          target = Path("app/android/app/google-services.json")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(
+              json.dumps(data, indent=2) + "\n",
+              encoding="utf-8"
           )
-
-          with open(path, encoding="utf-8") as f:
-              data = json.load(f)
-
-          assert isinstance(data, list) and data, \
-              "Location data must be a non-empty list."
-
-          assert all(
-              isinstance(d, dict) and isinstance(d.get("districts"), list)
-              for d in data
-          ), "Invalid division/district data."
-
-          print("Bangladesh location data validated.")
+          print("Firebase Android configuration created.")
           PY
+          elif [[ -f app/android/app/google-services.json ]]; then
+            echo "Using existing Firebase Android configuration."
+          else
+            echo "Firebase configuration not supplied; continuing."
+          fi
 
-      - name: Create Flutter Project
-        shell: bash
+      - name: Get Dependencies
+        working-directory: app
         run: |
           set -euo pipefail
-
-          flutter create \
-            --org com.bbd.blood \
-            --project-name bbd_app \
-            app
-
-          cp "$RUNNER_TEMP/bbd/google-services.json" \
-            app/android/app/google-services.json
-
-          mkdir -p app/assets
-
-          cp "$RUNNER_TEMP/bbd/bangladesh-geo.json" \
-            app/assets/bangladesh-geo.json
-
-      - name: Configure Dependencies and Assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd app
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path("pubspec.yaml")
-          s = p.read_text(encoding="utf-8")
-
-          if not re.search(r"(?m)^dependencies:\s*$", s):
-              raise SystemExit("Missing dependencies section.")
-
-          additions = (
-              "  firebase_core: 2.27.0\n"
-              "  cloud_firestore: 4.15.8\n"
-              "  url_launcher: 6.2.5\n"
-          )
-
-          s = re.sub(
-              r"(?m)^dependencies:\s*$",
-              lambda m: m.group(0) + "\n" + additions.rstrip("\n"),
-              s,
-              count=1
-          )
-
-          if "assets/bangladesh-geo.json" not in s:
-              pattern = r"(?m)^flutter:[ \t]*\r?\n"
-              match = re.search(pattern, s)
-
-              if not match:
-                  raise SystemExit("Missing top-level flutter section.")
-
-              insert_at = match.end()
-              asset_text = (
-                  "  assets:\n"
-                  "    - assets/bangladesh-geo.json\n"
-              )
-
-              s = s[:insert_at] + asset_text + s[insert_at:]
-
-          p.write_text(s, encoding="utf-8")
-          print("Dependencies and assets configured.")
-          PY
-
-      - name: Configure Google Services
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          root = Path("app/android")
-          settings = root / "settings.gradle"
-          app_gradle = root / "app/build.gradle"
-
-          for path in (settings, app_gradle):
-              if not path.is_file():
-                  raise SystemExit(f"Missing Gradle file: {path}")
-
-          # Register Google Services plugin.
-          s = settings.read_text(encoding="utf-8")
-
-          if "com.google.gms.google-services" not in s:
-              match = re.search(r"(?m)^plugins\s*\{", s)
-              if not match:
-                  raise SystemExit(
-                      "No plugins block found in settings.gradle"
-                  )
-
-              s = (
-                  s[:match.end()]
-                  + '\n    id "com.google.gms.google-services" '
-                    'version "4.4.1" apply false'
-                  + s[match.end():]
-              )
-
-          settings.write_text(s, encoding="utf-8")
-
-          # Apply plugin to the Android app module.
-          s = app_gradle.read_text(encoding="utf-8")
-
-          if "com.google.gms.google-services" not in s:
-              match = re.search(r"(?m)^plugins\s*\{", s)
-              if not match:
-                  raise SystemExit(
-                      "No plugins block found in app/build.gradle"
-                  )
-
-              close = s.find("}", match.end())
-              if close == -1:
-                  raise SystemExit(
-                      "Could not find end of app plugins block"
-                  )
-
-              s = (
-                  s[:close]
-                  + '\n    id "com.google.gms.google-services"\n'
-                  + s[close:]
-              )
-
-          app_gradle.write_text(s, encoding="utf-8")
-          print("Google Services plugin configured.")
-          PY
-          from pathlib import Path
-          import re
-
-          root = Path("app/android")
-          settings = root / "settings.gradle"
-          app_gradle = root / "app/build.gradle"
-
-          for path in (settings, app_gradle):
-              if not path.is_file():
-                  raise SystemExit(f"Missing Gradle file: {path}")
-
-          # Register Google Services plugin.
-          s = settings.read_text(encoding="utf-8")
-
-          if "com.google.gms.google-services" not in s:
-              match = re.search(r"(?m)^plugins\s*\{", s)
-              if not match:
-                  raise SystemExit(
-                      "No plugins block found in settings.gradle"
-                  )
-
-              s = (
-                  s[:match.end()]
-                  + '\n    id "com.google.gms.google-services" '
-                    'version "4.4.1" apply false'
-                  + s[match.end():]
-              )
-
-          settings.write_text(s, encoding="utf-8")
-
-          # Apply plugin to the Android app module.
-          s = app_gradle.read_text(encoding="utf-8")
-
-          if "com.google.gms.google-services" not in s:
-              match = re.search(r"(?m)^plugins\s*\{", s)
-              if not match:
-                  raise SystemExit(
-                      "No plugins block found in app/build.gradle"
-                  )
-
-              close = s.find("}", match.end())
-              if close == -1:
-                  raise SystemExit(
-                      "Could not find end of app plugins block"
-                  )
-
-              s = (
-                  s[:close]
-                  + '\n    id "com.google.gms.google-services"\n'
-                  + s[close:]
-              )
-
-          app_gradle.write_text(s, encoding="utf-8")
-          print("Google Services plugin configured.")
-          PY
-          from pathlib import Path
-
-          root = Path("app/android")
-          project = root / "build.gradle"
-          app = root / "app/build.gradle"
-
-          if not project.exists() or not app.exists():
-              raise SystemExit(
-                  "Expected Gradle files were not generated."
-              )
-
-          s = project.read_text(encoding="utf-8")
-
-          if "com.google.gms:google-services" not in s:
-              marker = "dependencies {"
-              if marker not in s:
-                  raise SystemExit(
-                      "Could not find project Gradle dependencies."
-                  )
-
-              s = s.replace(
-                  marker,
-                  marker + "\n"
-                  "        classpath "
-                  "'com.google.gms:google-services:4.4.1'",
-                  1
-              )
-
-          project.write_text(s, encoding="utf-8")
-
-          s = app.read_text(encoding="utf-8")
-
-          if "com.google.gms.google-services" not in s:
-              s += (
-                  "\n\n"
-                  "apply plugin: 'com.google.gms.google-services'\n"
-              )
-
-          app.write_text(s, encoding="utf-8")
-          print("Google Services plugin configured.")
-          PY
-
-      - name: Create BBD Application
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > app/lib/main.dart <<'DART'
-          import 'dart:convert';
-          import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart';
-          import 'package:firebase_core/firebase_core.dart';
-          import 'package:cloud_firestore/cloud_firestore.dart';
-          import 'package:url_launcher/url_launcher.dart';
-
-          const red = Color(0xFFD32F2F);
-          const groups = [
-            'A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-'
-          ];
-
-          Future<void> main() async {
-            WidgetsFlutterBinding.ensureInitialized();
-            await Firebase.initializeApp();
-            runApp(const BBDApp());
-          }
-
-          class BBDApp extends StatelessWidget {
-            const BBDApp({super.key});
-
-            @override
-            Widget build(BuildContext context) {
-              return MaterialApp(
-                title: 'BBD - Blood Donor',
-                debugShowCheckedModeBanner: false,
-                theme: ThemeData(
-                  colorScheme: ColorScheme.fromSeed(
-                    seedColor: red,
-                    primary: red,
-                  ),
-                  appBarTheme: const AppBarTheme(
-                    backgroundColor: red,
-                    foregroundColor: Colors.white,
-                  ),
-                  useMaterial3: true,
-                ),
-                home: const HomeScreen(),
-              );
-            }
-          }
-
-          class Locations {
-            final List<Map<String, dynamic>> divisions;
-            Locations(this.divisions);
-
-            static Future<Locations> load() async {
-              final raw = await rootBundle.loadString(
-                'assets/bangladesh-geo.json',
-              );
-              final decoded = jsonDecode(raw) as List;
-              return Locations(
-                decoded.map((e) => Map<String, dynamic>.from(e)).toList(),
-              );
-            }
-
-            static List<Map<String, dynamic>> children(
-              Map<String, dynamic>? parent,
-              String key,
-            ) {
-              final values = parent?[key] as List? ?? [];
-              return values
-                  .map((e) => Map<String, dynamic>.from(e))
-                  .toList();
-            }
-
-            static String name(Map<String, dynamic>? item) =>
-                item?['name']?.toString() ?? '';
-
-            static String label(Map<String, dynamic> item) {
-              final bn = item['bn_name']?.toString() ?? '';
-              final en = name(item);
-              if (bn.isEmpty) return en;
-              if (en.isEmpty || en == bn) return bn;
-              return '$bn ($en)';
-            }
-          }
-
-          class HomeScreen extends StatelessWidget {
-            const HomeScreen({super.key});
-
-            @override
-            Widget build(BuildContext context) {
-              return Scaffold(
-                appBar: AppBar(
-                  title: const Text('BBD - Blood Donor'),
-                ),
-                body: Center(
-                  child: ListView(
-                    shrinkWrap: true,
-                    padding: const EdgeInsets.all(24),
-                    children: [
-                      const Icon(
-                        Icons.bloodtype,
-                        size: 92,
-                        color: red,
-                      ),
-                      const Text(
-                        'Bangladesh Blood Donor',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 28),
-                      FilledButton(
-                        onPressed: () => Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const SearchScreen(),
-                          ),
-                        ),
-                        child: const Text('রক্ত খুঁজুন'),
-                      ),
-                      OutlinedButton(
-                        onPressed: () => Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const RegisterScreen(),
-                          ),
-                        ),
-                        child: const Text('রক্তদাতা হিসেবে নিবন্ধন'),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }
-          }
-
-          class RegisterScreen extends StatefulWidget {
-            const RegisterScreen({super.key});
-
-            @override
-            State<RegisterScreen> createState() => _RegisterScreenState();
-          }
-
-          class _RegisterScreenState extends State<RegisterScreen> {
-            final name = TextEditingController();
-            final phone = TextEditingController();
-
-            Locations? locations;
-            Map<String, dynamic>? division;
-            Map<String, dynamic>? district;
-            Map<String, dynamic>? upazila;
-            DateTime? dob;
-            String blood = 'A+';
-            bool saving = false;
-            String? error;
-
-            List<Map<String, dynamic>> get divisions =>
-                locations?.divisions ?? [];
-
-            List<Map<String, dynamic>> get districts =>
-                Locations.children(division, 'districts');
-
-            List<Map<String, dynamic>> get upazilas =>
-                Locations.children(district, 'upazilas');
-
-            @override
-            void initState() {
-              super.initState();
-              loadLocations();
-            }
-
-            Future<void> loadLocations() async {
-              try {
-                final data = await Locations.load();
-                if (!mounted) return;
-                setState(() {
-                  locations = data;
-                  division = data.divisions.isEmpty
-                      ? null : data.divisions.first;
-                  district = districts.isEmpty ? null : districts.first;
-                  upazila = upazilas.isEmpty ? null : upazilas.first;
-                });
-              } catch (e) {
-                if (mounted) setState(() => error = 'লোকেশন লোড হয়নি: $e');
-              }
-            }
-
-            @override
-            void dispose() {
-              name.dispose();
-              phone.dispose();
-              super.dispose();
-            }
-
-            Future<void> register() async {
-              if (name.text.trim().isEmpty ||
-                  phone.text.trim().isEmpty ||
-                  dob == null ||
-                  division == null ||
-                  district == null ||
-                  upazila == null) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('সব তথ্য পূরণ করো।'),
-                  ),
-                );
-                return;
-              }
-
-              final now = DateTime.now();
-              final birth = dob!;
-              var age = now.year - birth.year;
-
-              if (now.month < birth.month ||
-                  (now.month == birth.month && now.day < birth.day)) {
-                age--;
-              }
-
-              if (age < 18) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('রক্তদাতা হতে ন্যূনতম ১৮ বছর হতে হবে।'),
-                  ),
-                );
-                return;
-              }
-
-              setState(() => saving = true);
-
-              try {
-                await FirebaseFirestore.instance.collection('donors').add({
-                  'name': name.text.trim(),
-                  'phone': phone.text.trim(),
-                  'blood': blood,
-                  'division': Locations.name(division),
-                  'divisionBn': division!['bn_name'] ?? '',
-                  'district': Locations.name(district),
-                  'districtBn': district!['bn_name'] ?? '',
-                  'upazila': Locations.name(upazila),
-                  'upazilaBn': upazila!['bn_name'] ?? '',
-                  'dob': Timestamp.fromDate(birth),
-                  'createdAt': FieldValue.serverTimestamp(),
-                  'available': true,
-                });
-
-                if (!mounted) return;
-                await showDialog<void>(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: const Text('নিবন্ধন সফল'),
-                    content: const Text(
-                      'তোমার তথ্য সংরক্ষিত হয়েছে।',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(ctx),
-                        child: const Text('ঠিক আছে'),
-                      ),
-                    ],
-                  ),
-                );
-
-                if (mounted) Navigator.pop(context);
-              } catch (e) {
-                if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('সংরক্ষণ করা যায়নি: $e')),
-                );
-              } finally {
-                if (mounted) setState(() => saving = false);
-              }
-            }
-
-            Widget dropdown({
-              required String label,
-              required List<Map<String, dynamic>> items,
-              required Map<String, dynamic>? value,
-              required ValueChanged<Map<String, dynamic>?> onChanged,
-            }) {
-              return DropdownButtonFormField<String>(
-                value: items.any(
-                  (e) => Locations.name(e) == Locations.name(value),
-                ) ? Locations.name(value) : null,
-                isExpanded: true,
-                decoration: InputDecoration(labelText: label),
-                items: items.map((item) => DropdownMenuItem<String>(
-                  value: Locations.name(item),
-                  child: Text(
-                    Locations.label(item),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                )).toList(),
-                onChanged: (selected) {
-                  if (selected == null) return;
-                  final item = items.firstWhere(
-                    (e) => Locations.name(e) == selected,
-                  );
-                  onChanged(item);
-                },
-              );
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              if (locations == null) {
-                return Scaffold(
-                  appBar: AppBar(title: const Text('রক্তদাতা নিবন্ধন')),
-                  body: Center(
-                    child: error == null
-                        ? const CircularProgressIndicator()
-                        : Text(error!),
-                  ),
-                );
-              }
-
-              return Scaffold(
-                appBar: AppBar(title: const Text('রক্তদাতা নিবন্ধন')),
-                body: ListView(
-                  padding: const EdgeInsets.all(16),
-                  children: [
-                    TextField(
-                      controller: name,
-                      decoration: const InputDecoration(
-                        labelText: 'পূর্ণ নাম',
-                      ),
-                    ),
-                    TextField(
-                      controller: phone,
-                      keyboardType: TextInputType.phone,
-                      decoration: const InputDecoration(
-                        labelText: 'ফোন নম্বর',
-                      ),
-                    ),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(dob == null
-                          ? 'জন্মতারিখ নির্বাচন করো'
-                          : '${dob!.day}/${dob!.month}/${dob!.year}'),
-                      onTap: () async {
-                        final picked = await showDatePicker(
-                          context: context,
-                          initialDate: DateTime(2000),
-                          firstDate: DateTime(1900),
-                          lastDate: DateTime.now(),
-                        );
-                        if (picked != null) setState(() => dob = picked);
-                      },
-                    ),
-                    DropdownButtonFormField<String>(
-                      value: blood,
-                      decoration: const InputDecoration(
-                        labelText: 'রক্তের গ্রুপ',
-                      ),
-                      items: groups.map((g) => DropdownMenuItem(
-                        value: g,
-                        child: Text(g),
-                      )).toList(),
-                      onChanged: (v) {
-                        if (v != null) setState(() => blood = v);
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'বিভাগ',
-                      items: divisions,
-                      value: division,
-                      onChanged: (v) => setState(() {
-                        division = v;
-                        district = districts.isEmpty ? null : districts.first;
-                        upazila = upazilas.isEmpty ? null : upazilas.first;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'জেলা',
-                      items: districts,
-                      value: district,
-                      onChanged: (v) => setState(() {
-                        district = v;
-                        upazila = upazilas.isEmpty ? null : upazilas.first;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'উপজেলা',
-                      items: upazilas,
-                      value: upazila,
-                      onChanged: (v) => setState(() => upazila = v),
-                    ),
-                    const SizedBox(height: 24),
-                    FilledButton(
-                      onPressed: saving ? null : register,
-                      child: Text(
-                        saving ? 'সংরক্ষণ হচ্ছে...' : 'নিবন্ধন করুন',
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    const Text(
-                      'রক্তদানের যোগ্যতা স্বাস্থ্যকর্মীর কাছে নিশ্চিত করো। '
-                      'অসুস্থ হলে আগে চিকিৎসকের পরামর্শ নাও। '
-                      'রক্তদানের পর স্বাস্থ্যকর্মীর নির্দেশনা মেনে চলো। '
-                      'রক্ত দিতে না পারলে অ্যাপে নিজের প্রাপ্যতা বন্ধ করো। '
-                      'রক্তদানের জন্য প্রাপকের সঙ্গে চিকিৎসাকেন্দ্রে দেখা করো।',
-                    ),
-                  ],
-                ),
-              );
-            }
-          }
-
-          class SearchScreen extends StatefulWidget {
-            const SearchScreen({super.key});
-
-            @override
-            State<SearchScreen> createState() => _SearchScreenState();
-          }
-
-          class _SearchScreenState extends State<SearchScreen> {
-            Locations? locations;
-            Map<String, dynamic>? division;
-            Map<String, dynamic>? district;
-            Map<String, dynamic>? upazila;
-            String blood = 'A+';
-            bool searched = false;
-            String? error;
-
-            List<Map<String, dynamic>> get divisions =>
-                locations?.divisions ?? [];
-
-            List<Map<String, dynamic>> get districts =>
-                Locations.children(division, 'districts');
-
-            List<Map<String, dynamic>> get upazilas =>
-                Locations.children(district, 'upazilas');
-
-            @override
-            void initState() {
-              super.initState();
-              loadLocations();
-            }
-
-            Future<void> loadLocations() async {
-              try {
-                final data = await Locations.load();
-                if (!mounted) return;
-                setState(() {
-                  locations = data;
-                  division = data.divisions.isEmpty
-                      ? null : data.divisions.first;
-                  district = districts.isEmpty ? null : districts.first;
-                  upazila = upazilas.isEmpty ? null : upazilas.first;
-                });
-              } catch (e) {
-                if (mounted) setState(() => error = 'লোকেশন লোড হয়নি: $e');
-              }
-            }
-
-            Widget dropdown({
-              required String label,
-              required List<Map<String, dynamic>> items,
-              required Map<String, dynamic>? value,
-              required ValueChanged<Map<String, dynamic>?> onChanged,
-            }) {
-              return DropdownButtonFormField<String>(
-                value: items.any(
-                  (e) => Locations.name(e) == Locations.name(value),
-                ) ? Locations.name(value) : null,
-                isExpanded: true,
-                decoration: InputDecoration(labelText: label),
-                items: items.map((item) => DropdownMenuItem<String>(
-                  value: Locations.name(item),
-                  child: Text(
-                    Locations.label(item),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                )).toList(),
-                onChanged: (selected) {
-                  if (selected == null) return;
-                  onChanged(items.firstWhere(
-                    (e) => Locations.name(e) == selected,
-                  ));
-                },
-              );
-            }
-
-            Future<void> callDonor(String phone) async {
-              final uri = Uri(scheme: 'tel', path: phone);
-              if (await canLaunchUrl(uri)) {
-                await launchUrl(uri);
-              }
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              if (locations == null) {
-                return Scaffold(
-                  appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
-                  body: Center(
-                    child: error == null
-                        ? const CircularProgressIndicator()
-                        : Text(error!),
-                  ),
-                );
-              }
-
-              return Scaffold(
-                appBar: AppBar(title: const Text('রক্ত খুঁজুন')),
-                body: ListView(
-                  padding: const EdgeInsets.all(16),
-                  children: [
-                    DropdownButtonFormField<String>(
-                      value: blood,
-                      decoration: const InputDecoration(
-                        labelText: 'রক্তের গ্রুপ',
-                      ),
-                      items: groups.map((g) => DropdownMenuItem(
-                        value: g,
-                        child: Text(g),
-                      )).toList(),
-                      onChanged: (v) {
-                        if (v != null) {
-                          setState(() {
-                            blood = v;
-                            searched = false;
-                          });
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'বিভাগ',
-                      items: divisions,
-                      value: division,
-                      onChanged: (v) => setState(() {
-                        division = v;
-                        district = districts.isEmpty ? null : districts.first;
-                        upazila = upazilas.isEmpty ? null : upazilas.first;
-                        searched = false;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'জেলা',
-                      items: districts,
-                      value: district,
-                      onChanged: (v) => setState(() {
-                        district = v;
-                        upazila = upazilas.isEmpty ? null : upazilas.first;
-                        searched = false;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    dropdown(
-                      label: 'উপজেলা',
-                      items: upazilas,
-                      value: upazila,
-                      onChanged: (v) => setState(() {
-                        upazila = v;
-                        searched = false;
-                      }),
-                    ),
-                    const SizedBox(height: 16),
-                    FilledButton(
-                      onPressed: () => setState(() => searched = true),
-                      child: const Text('রক্তদাতা খুঁজুন'),
-                    ),
-                    if (searched)
-                      if (division == null ||
-                          district == null ||
-                          upazila == null)
-                        const Text('বিভাগ, জেলা ও উপজেলা নির্বাচন করো।')
-                      else
-                        StreamBuilder<
-                            QuerySnapshot<Map<String, dynamic>>>(
-                          stream: FirebaseFirestore.instance
-                              .collection('donors')
-                              .where('blood', isEqualTo: blood)
-                              .where(
-                                'division',
-                                isEqualTo: Locations.name(division),
-                              )
-                              .where(
-                                'district',
-                                isEqualTo: Locations.name(district),
-                              )
-                              .where(
-                                'upazila',
-                                isEqualTo: Locations.name(upazila),
-                              )
-                              .where('available', isEqualTo: true)
-                              .snapshots(),
-                          builder: (context, snapshot) {
-                            if (snapshot.hasError) {
-                              return const Padding(
-                                padding: EdgeInsets.all(12),
-                                child: Text(
-                                  'সার্চে সমস্যা হয়েছে। ইন্টারনেট, '
-                                  'Firestore Rules এবং প্রয়োজনীয় index পরীক্ষা করো।',
-                                ),
-                              );
-                            }
-
-                            if (snapshot.connectionState ==
-                                ConnectionState.waiting) {
-                              return const Padding(
-                                padding: EdgeInsets.all(24),
-                                child: Center(
-                                  child: CircularProgressIndicator(),
-                                ),
-                              );
-                            }
-
-                            final docs = snapshot.data?.docs ?? [];
-
-                            if (docs.isEmpty) {
-                              return const Padding(
-                                padding: EdgeInsets.all(16),
-                                child: Text(
-                                  'এই উপজেলায় কোনো উপলভ্য রক্তদাতা পাওয়া যায়নি।',
-                                ),
-                              );
-                            }
-
-                            return Column(
-                              children: docs.map((doc) {
-                                final d = doc.data();
-                                return Card(
-                                  child: ListTile(
-                                    title: Text(
-                                      '${d['name'] ?? ''} '
-                                      '(${d['blood'] ?? ''})',
-                                    ),
-                                    subtitle: Text(
-                                      '${d['divisionBn'] ?? d['division']}, '
-                                      '${d['districtBn'] ?? d['district']}, '
-                                      '${d['upazilaBn'] ?? d['upazila']}\n'
-                                      '${d['phone'] ?? ''}',
-                                    ),
-                                    trailing: IconButton(
-                                      icon: const Icon(
-                                        Icons.call,
-                                        color: Colors.green,
-                                      ),
-                                      onPressed: () => callDonor(
-                                        d['phone'].toString(),
-                                      ),
-                                    ),
-                                  ),
-                                );
-                              }).toList(),
-                            );
-                          },
-                        ),
-                  ],
-                ),
-              );
-            }
-          }
-          DART
-
-      - name: Validate Flutter Project
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd app
-
           flutter pub get
+
+      - name: Validate Dart Code
+        working-directory: app
+        run: |
+          set -euo pipefail
+          dart format --output=none --set-exit-if-changed lib
           flutter analyze
 
-      - name: Build Android APK
-        shell: bash
+      - name: Build Release APK
+        working-directory: app
         run: |
           set -euo pipefail
-          cd app
+          flutter build apk --release
 
-          flutter build apk --debug
+      - name: Verify APK
+        run: |
+          set -euo pipefail
 
-          test -f build/app/outputs/flutter-apk/app-debug.apk
+          APK="app/build/app/outputs/flutter-apk/app-release.apk"
 
-      - name: Upload APK Artifact
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::APK was not generated."
+            exit 1
+          fi
+
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: Upload BBD APK
         uses: actions/upload-artifact@v4
         with:
-          name: BBD-Blood-Donor-App
-          path: app/build/app/outputs/flutter-apk/app-debug.apk
+          name: BBD-Android-APK
+          path: app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+          retention-days: 14
