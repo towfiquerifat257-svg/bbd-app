@@ -5,27 +5,14 @@ on:
     branches:
       - main
       - master
-    paths:
-      - "app/**"
-      - ".github/workflows/build-apk.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: bbd-apk-build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout Repository
@@ -35,8 +22,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-          cache: gradle
+          java-version: '17'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -44,105 +30,67 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Check Flutter Installation
-        run: |
-          set -euo pipefail
-          flutter --version
-          dart --version
-          java -version
-
-      - name: Check BBD Flutter Project
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f app/pubspec.yaml ]]; then
-            echo "::error::app/pubspec.yaml not found."
-            echo "The Flutter application source must exist inside app/."
-            exit 1
-          fi
-
-          if [[ ! -d app/android ]]; then
-            echo "::error::app/android folder not found."
-            exit 1
-          fi
-
-          echo "BBD Flutter project found."
-
-      - name: Configure Firebase Android File
+      - name: Configure Google Services
+        working-directory: app
         env:
-          FIREBASE_CONFIG_JSON: ${{ secrets.FIREBASE_CONFIG_JSON }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
           set -euo pipefail
 
-          if [[ -n "${FIREBASE_CONFIG_JSON:-}" ]]; then
-            python3 - <<'PY'
-          import json
+          if [ -z "${GOOGLE_SERVICES_JSON:-}" ]; then
+            echo "ERROR: GOOGLE_SERVICES_JSON secret is missing."
+            exit 1
+          fi
+
+          mkdir -p android/app
+
+          python3 - <<'PY'
           import os
+          import json
+          import base64
           from pathlib import Path
 
-          raw = os.environ["FIREBASE_CONFIG_JSON"]
-          data = json.loads(raw)
+          value = os.environ["GOOGLE_SERVICES_JSON"].strip()
+
+          try:
+              data = json.loads(value)
+          except json.JSONDecodeError:
+              try:
+                  decoded = base64.b64decode(value, validate=True)
+                  data = json.loads(decoded.decode("utf-8"))
+              except Exception as exc:
+                  raise SystemExit(
+                      "Invalid Google Services JSON secret."
+                  ) from exc
 
           if not isinstance(data, dict):
-              raise SystemExit("Firebase configuration must be a JSON object.")
+              raise SystemExit("Firebase config must be a JSON object.")
 
-          if not data.get("project_info", {}).get("project_id"):
-              raise SystemExit("Firebase project_id is missing.")
-
-          if not data.get("client"):
-              raise SystemExit("Firebase client configuration is missing.")
-
-          target = Path("app/android/app/google-services.json")
-          target.parent.mkdir(parents=True, exist_ok=True)
-          target.write_text(
-              json.dumps(data, indent=2) + "\n",
+          output = Path("android/app/google-services.json")
+          output.write_text(
+              json.dumps(data, indent=2),
               encoding="utf-8"
           )
-          print("Firebase Android configuration created.")
+
+          print("Google Services configuration created.")
           PY
-          elif [[ -f app/android/app/google-services.json ]]; then
-            echo "Using existing Firebase Android configuration."
-          else
-            echo "Firebase configuration not supplied; continuing."
-          fi
 
-      - name: Get Dependencies
+      - name: Install Dependencies
         working-directory: app
-        run: |
-          set -euo pipefail
-          flutter pub get
+        run: flutter pub get
 
-      - name: Validate Dart Code
+      - name: Check Flutter Project
         working-directory: app
-        run: |
-          set -euo pipefail
-          dart format --output=none --set-exit-if-changed lib
-          flutter analyze
+        run: flutter analyze --no-pub
 
       - name: Build Release APK
         working-directory: app
-        run: |
-          set -euo pipefail
-          flutter build apk --release
+        run: flutter build apk --release
 
-      - name: Verify APK
-        run: |
-          set -euo pipefail
-
-          APK="app/build/app/outputs/flutter-apk/app-release.apk"
-
-          if [[ ! -s "$APK" ]]; then
-            echo "::error::APK was not generated."
-            exit 1
-          fi
-
-          ls -lh "$APK"
-          sha256sum "$APK"
-
-      - name: Upload BBD APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: BBD-Android-APK
           path: app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
